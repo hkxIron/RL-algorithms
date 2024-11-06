@@ -9,14 +9,14 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.distributions import Normal
-from multiprocessing_env import SubprocVecEnv
+#from multiprocessing_env import SubprocVecEnv
 import matplotlib.pyplot as plt
 
 use_cuda = torch.cuda.is_available()
 device   = torch.device("cuda" if use_cuda else "cpu")
 
 num_envs = 16
-env_name = "Pendulum-v0"
+env_name = "Pendulum-v1"
 
 def make_env():
     def _thunk():
@@ -25,10 +25,10 @@ def make_env():
 
     return _thunk
 
-envs = [make_env() for i in range(num_envs)]
-envs = SubprocVecEnv(envs)
+# envs = [make_env() for i in range(num_envs)]
+# envs = SubprocVecEnv(envs)
 
-env = gym.make(env_name)
+envs = gym.make(env_name)
 
 
 def init_weights(m):
@@ -59,7 +59,7 @@ class ActorCritic(nn.Module):
     def forward(self, x):
         value = self.critic(x)
         mu = self.actor(x)
-        std = self.log_std.exp().expand_as(mu)
+        std = self.log_std.exp().squeeze()
         dist = Normal(mu, std)
         return dist, value
 
@@ -72,16 +72,16 @@ def plot(frame_idx, rewards):
 
 
 def test_env(vis=False):
-    state = env.reset()
-    if vis: env.render()
+    state, _ = envs.reset()
+    if vis: envs.render()
     done = False
     total_reward = 0
     while not done:
         state = torch.FloatTensor(state).unsqueeze(0).to(device)
         dist, _ = model(state)
-        next_state, reward, done, _ = env.step(dist.sample().cpu().numpy()[0])
+        next_state, reward, done, _, _ = envs.step(dist.sample().cpu().numpy()[0])
         state = next_state
-        if vis: env.render()
+        if vis: envs.render()
         total_reward += reward
     return total_reward
 
@@ -100,11 +100,11 @@ def ppo_iter(mini_batch_size, states, actions, log_probs, returns, advantage):
     batch_size = states.size(0)
     for _ in range(batch_size // mini_batch_size):
         rand_ids = np.random.randint(0, batch_size, mini_batch_size)
-        yield states[rand_ids, :], actions[rand_ids, :], log_probs[rand_ids, :], returns[rand_ids, :], advantage[
-                                                                                                       rand_ids, :]
+        yield states[rand_ids, :], actions[rand_ids, :], log_probs.unsqueeze(-1)[rand_ids, :], returns[rand_ids, :], advantage[rand_ids, :]
 
 
 def ppo_update(ppo_epochs, mini_batch_size, states, actions, log_probs, returns, advantages, clip_param=0.2):
+    print(f"update: {ppo_epochs}")
     for _ in range(ppo_epochs):
         for state, action, old_log_probs, return_, advantage in ppo_iter(mini_batch_size, states, actions, log_probs,
                                                                          returns, advantages):
@@ -129,7 +129,7 @@ num_inputs  = envs.observation_space.shape[0]
 num_outputs = envs.action_space.shape[0]
 
 #Hyper params:
-hidden_size      = 256
+hidden_size      = 32
 lr               = 3e-4
 num_steps        = 20
 mini_batch_size  = 5
@@ -143,10 +143,11 @@ max_frames = 15000
 frame_idx  = 0
 test_rewards = []
 
-state = envs.reset()
+state, _ = envs.reset()
 early_stop = False
 
 while frame_idx < max_frames and not early_stop:
+    print('frame %s' % (frame_idx))
 
     log_probs = []
     values = []
@@ -161,15 +162,15 @@ while frame_idx < max_frames and not early_stop:
         dist, value = model(state)
 
         action = dist.sample()
-        next_state, reward, done, _ = envs.step(action.cpu().numpy())
+        next_state, reward, done, is_truncated, _ = envs.step(action.cpu().numpy())
 
         log_prob = dist.log_prob(action)
         entropy += dist.entropy().mean()
 
         log_probs.append(log_prob)
         values.append(value)
-        rewards.append(torch.FloatTensor(reward).unsqueeze(1).to(device))
-        masks.append(torch.FloatTensor(1 - done).unsqueeze(1).to(device))
+        rewards.append(torch.FloatTensor(np.array([reward])).unsqueeze(1).to(device))
+        masks.append(torch.FloatTensor(np.array([1 - done])).unsqueeze(1).to(device))
 
         states.append(state)
         actions.append(action)
@@ -177,10 +178,11 @@ while frame_idx < max_frames and not early_stop:
         state = next_state
         frame_idx += 1
 
-        if frame_idx % 1000 == 0:
+        if frame_idx % 100 == 0:
             test_reward = np.mean([test_env() for _ in range(10)])
             test_rewards.append(test_reward)
-            plot(frame_idx, test_rewards)
+            print('frame %s. reward: %s' % (frame_idx, rewards[-1]))
+            #plot(frame_idx, test_rewards)
             if test_reward > threshold_reward: early_stop = True
 
     next_state = torch.FloatTensor(next_state).to(device)
@@ -190,8 +192,8 @@ while frame_idx < max_frames and not early_stop:
     returns = torch.cat(returns).detach()
     log_probs = torch.cat(log_probs).detach()
     values = torch.cat(values).detach()
-    states = torch.cat(states)
-    actions = torch.cat(actions)
+    states = torch.stack(states,dim=0)
+    actions = torch.stack(actions,dim=0)
     advantage = returns - values
 
     ppo_update(ppo_epochs, mini_batch_size, states, actions, log_probs, returns, advantage)
